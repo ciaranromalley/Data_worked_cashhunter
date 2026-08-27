@@ -42,6 +42,45 @@ STAGING_COLS = ("company_number", "name", "company_type", "status",
                 "sic_text", "accounts_category", "accounts_last_made_up",
                 "charges_outstanding", "tier", "tier_rule", "sector")
 
+# A single all-rows upsert (300-600k rows, maintaining two GIN trigram
+# indexes in one transaction) was heavy enough on a free-tier instance to
+# trigger a Postgres restart mid-transaction ("the database system is in
+# recovery mode", 57P03) rather than a client-side timeout. Batching bounds
+# each transaction's memory footprint; a failure now loses one batch, not
+# the whole run. Lower this further if 57P03 recurs.
+BATCH_SIZE = 10_000
+
+MERGE_SQL = f"""
+    with batch as (
+      select distinct on (company_number) {', '.join(STAGING_COLS)}
+      from staging
+      where company_number > %(after)s
+      order by company_number
+      limit %(size)s
+    )
+    insert into companies ({', '.join(STAGING_COLS)})
+    select {', '.join(STAGING_COLS)} from batch
+    on conflict (company_number) do update set
+      name = excluded.name,
+      company_type = excluded.company_type,
+      status = excluded.status,
+      postcode = excluded.postcode,
+      post_town = excluded.post_town,
+      sic_codes = excluded.sic_codes,
+      sic_text = excluded.sic_text,
+      accounts_category = excluded.accounts_category,
+      accounts_last_made_up = excluded.accounts_last_made_up,
+      charges_outstanding = excluded.charges_outstanding,
+      tier = case when companies.tier_source = 'manual'
+                  then companies.tier else excluded.tier end,
+      tier_rule = case when companies.tier_source = 'manual'
+                  then companies.tier_rule else excluded.tier_rule end,
+      sector = case when companies.tier_source = 'manual'
+                  then companies.sector else excluded.sector end,
+      updated_at = now()
+    returning company_number
+"""
+
 
 def load_rules(conn) -> list[tuple[str, str, str, str]]:
     """[(prefix, tier, sector, prefix)] longest-prefix-first."""
@@ -137,49 +176,52 @@ def main() -> None:
         print(f"{source} already loaded; nothing to do")
         return
     run_id = start_run(conn, "universe", source)
-    kept = 0
+    kept = merged = batches = 0
     try:
         with tmpdir() as td:
             path = download(url, td)
             rules = load_rules(conn)
+
+            # Load: NOT "on commit drop" — that would wipe staging at the
+            # first commit below. Default (ON COMMIT PRESERVE ROWS) keeps
+            # it alive for the rest of this session; it vanishes when the
+            # connection closes, which is exactly the lifetime we want.
             with conn.cursor() as cur:
                 cur.execute(
-                    "create temp table staging (like companies including defaults) "
-                    "on commit drop")
+                    "create temp table staging (like companies including defaults)")
                 with cur.copy(
                     f"copy staging ({', '.join(STAGING_COLS)}) from stdin"
                 ) as copy:
                     for row in iter_filtered_rows(path, rules):
                         copy.write_row(row)
                         kept += 1
-                # merge: registry fields always refresh; tiering fields only
-                # where the human has not overridden them
-                cur.execute(f"""
-                    insert into companies ({', '.join(STAGING_COLS)})
-                    select distinct on (company_number) {', '.join(STAGING_COLS)}
-                    from staging
-                    on conflict (company_number) do update set
-                      name = excluded.name,
-                      company_type = excluded.company_type,
-                      status = excluded.status,
-                      postcode = excluded.postcode,
-                      post_town = excluded.post_town,
-                      sic_codes = excluded.sic_codes,
-                      sic_text = excluded.sic_text,
-                      accounts_category = excluded.accounts_category,
-                      accounts_last_made_up = excluded.accounts_last_made_up,
-                      charges_outstanding = excluded.charges_outstanding,
-                      tier = case when companies.tier_source = 'manual'
-                                  then companies.tier else excluded.tier end,
-                      tier_rule = case when companies.tier_source = 'manual'
-                                  then companies.tier_rule else excluded.tier_rule end,
-                      sector = case when companies.tier_source = 'manual'
-                                  then companies.sector else excluded.sector end,
-                      updated_at = now()
-                """)
-                # companies that left the snapshot (dissolved, gone dormant,
-                # or SIC drifted out of scope): mark, don't delete — history
-                # and shortlist notes stay intact, and v1 UI still shows them
+                # index AFTER the copy (cheaper than maintaining it during
+                # load) — required so each batch below does an index scan
+                # from its starting point rather than re-sorting everything
+                # remaining on every iteration
+                cur.execute("create index on staging (company_number)")
+            conn.commit()   # isolate the fast, safely-redoable load...
+
+            # ...from the merge, which is the step that was crashing the
+            # database. Each batch is its own transaction.
+            after = ""
+            with conn.cursor() as cur:
+                while True:
+                    cur.execute(MERGE_SQL, {"after": after, "size": BATCH_SIZE})
+                    rows = cur.fetchall()
+                    if not rows:
+                        break
+                    after = max(r[0] for r in rows)
+                    merged += len(rows)
+                    batches += 1
+                    conn.commit()
+                    print(f"  batch {batches}: {merged:,} merged (last {after})")
+
+            # companies that left the snapshot (dissolved, gone dormant, or
+            # SIC drifted out of scope): mark, don't delete. Bounded by the
+            # PREVIOUS companies table, not the new staging set, so on a
+            # first run (empty companies) this matches nothing.
+            with conn.cursor() as cur:
                 cur.execute("""
                     update companies c set status = 'lapsed', updated_at = now()
                     where c.status = 'active'
@@ -187,11 +229,23 @@ def main() -> None:
                                       where s.company_number = c.company_number)
                 """)
             conn.commit()
-        finish_run(conn, run_id, "ok", {"rows": kept})
-        print(f"universe: {kept:,} companies merged from {source}")
+
+        finish_run(conn, run_id, "ok",
+                  {"rows_loaded": kept, "rows_merged": merged, "batches": batches})
+        print(f"universe: {merged:,} companies merged from {source} in {batches} batches")
     except Exception as e:
-        conn.rollback()
-        finish_run(conn, run_id, "failed", {"rows": kept, "error": str(e)[:500]})
+        detail = {"rows_loaded": kept, "rows_merged": merged,
+                  "batches": batches, "error": str(e)[:500]}
+        try:
+            conn.rollback()
+        except Exception:
+            pass   # connection may already be dead (e.g. server restart) —
+                   # the batches already committed are safe regardless
+        try:
+            finish_run(conn, run_id, "failed", detail)
+        except Exception:
+            pass   # can't log to a dead connection; check Supabase's own
+                   # Postgres/Pooler logs for the server-side reason
         raise
 
 
