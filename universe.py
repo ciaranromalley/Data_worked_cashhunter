@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import json
 import re
 import sys
 import zipfile
@@ -164,6 +165,23 @@ def iter_filtered_rows(zip_path: str, rules):
                 )
 
 
+def get_checkpoint(conn, kind: str, source: str) -> str | None:
+    """Furthest company_number ever successfully committed for a prior
+    attempt at this exact source file, across ALL attempts (not just the
+    most recent — a later attempt can fail earlier than one before it, so
+    this takes whichever attempt got furthest, not whichever was latest).
+    Returns None if there's no prior attempt with any committed progress.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "select detail->>'last_key' from pipeline_runs "
+            "where kind = %s and source_file = %s and detail ? 'last_key' "
+            "order by (detail->>'batches')::int desc limit 1",
+            (kind, source))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", help="snapshot ZIP url (default: scrape the page)")
@@ -175,8 +193,21 @@ def main() -> None:
     if already_processed(conn, "universe", source):
         print(f"{source} already loaded; nothing to do")
         return
+
+    # Resume support. Re-download/re-filter/re-COPY still happen either way
+    # (staging is a per-session temp table — it can't survive across
+    # separate script runs), but that's comparatively cheap I/O. What this
+    # actually saves is re-running the expensive, index-maintaining upsert
+    # against rows already correctly sitting in `companies` — which matters
+    # because that's the step that has actually crashed the database before.
+    resume_from = get_checkpoint(conn, "universe", source)
+    if resume_from:
+        print(f"resuming after {resume_from} (checkpoint from a previous attempt)")
+
     run_id = start_run(conn, "universe", source)
     kept = merged = batches = 0
+    after = resume_from or ""   # defined up front: needed by the except
+                               # block even if we fail before the loop runs
     try:
         with tmpdir() as td:
             path = download(url, td)
@@ -203,8 +234,10 @@ def main() -> None:
             conn.commit()   # isolate the fast, safely-redoable load...
 
             # ...from the merge, which is the step that was crashing the
-            # database. Each batch is its own transaction.
-            after = ""
+            # database. Each batch is its own transaction, and the progress
+            # checkpoint commits atomically WITH the batch it describes: if
+            # the process dies right after, the next attempt resumes here
+            # rather than from scratch.
             with conn.cursor() as cur:
                 while True:
                     cur.execute(MERGE_SQL, {"after": after, "size": BATCH_SIZE})
@@ -214,6 +247,10 @@ def main() -> None:
                     after = max(r[0] for r in rows)
                     merged += len(rows)
                     batches += 1
+                    cur.execute(
+                        "update pipeline_runs set detail = %s::jsonb where id = %s",
+                        (json.dumps({"rows_loaded": kept, "rows_merged": merged,
+                                    "batches": batches, "last_key": after}), run_id))
                     conn.commit()
                     print(f"  batch {batches}: {merged:,} merged (last {after})")
 
@@ -231,11 +268,12 @@ def main() -> None:
             conn.commit()
 
         finish_run(conn, run_id, "ok",
-                  {"rows_loaded": kept, "rows_merged": merged, "batches": batches})
+                  {"rows_loaded": kept, "rows_merged": merged,
+                   "batches": batches, "last_key": after})
         print(f"universe: {merged:,} companies merged from {source} in {batches} batches")
     except Exception as e:
         detail = {"rows_loaded": kept, "rows_merged": merged,
-                  "batches": batches, "error": str(e)[:500]}
+                  "batches": batches, "last_key": after, "error": str(e)[:500]}
         try:
             conn.rollback()
         except Exception:
