@@ -1,0 +1,21 @@
+name: universe
+on:
+  schedule:
+    - cron: "0 6 6 * *"
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Optional snapshot ZIP url"
+        required: false
+jobs:
+  universe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python universe.py ${{ inputs.url && format('--url {0}', inputs.url) || '' }}
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
