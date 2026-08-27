@@ -1,0 +1,17 @@
+name: accounts-daily
+on:
+  schedule:
+    - cron: "0 8 * * 2-6"
+  workflow_dispatch: {}
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python accounts.py --daily
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
